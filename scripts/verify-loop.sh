@@ -243,8 +243,9 @@ PERSON_HITS=$(json 'd.items.length' < "$WORK/body")
 if [ "$PERSON_HITS" = "1" ]; then ok "按来源人物反查命中 1 条"; else bad "来源人物反查异常：$PERSON_HITS"; fi
 
 code=$(req GET "$V1/families/$FID/timeline" "$JAR_A" "" "$TOKEN_A"); expect "$code" 200 "时间轴分组"
-GROUPS=$(json 'd.groups.length' < "$WORK/body")
-if [ "$GROUPS" -ge 1 ]; then ok "时间轴返回 $GROUPS 个时段分组"; else bad "时间轴无分组"; fi
+# 变量名不能叫 GROUPS：它是 bash 内置数组（用户组 ID 列表），带命令替换的赋值会失败并被 set -e 终止
+TL_GROUPS=$(json 'd.groups.length' < "$WORK/body")
+if [ "$TL_GROUPS" -ge 1 ]; then ok "时间轴返回 $TL_GROUPS 个时段分组"; else bad "时间轴无分组"; fi
 
 code=$(req GET "$V1/families/$FID/stats" "$JAR_A" "" "$TOKEN_A"); expect "$code" 200 "家庭统计"
 

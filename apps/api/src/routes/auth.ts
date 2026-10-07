@@ -31,9 +31,11 @@ authRouter.post(
   authLimiter,
   validateBody(registerSchema),
   asyncHandler(async (req, res) => {
+    // 首个用户的放行与授管理员判定在 authService.register 的事务里原子完成，
+    // 这里只传静态配置，路由层不再做有竞态的 count 查询
     const user = await authService.register(req.body, {
       ...clientMeta(req),
-      allowPublicSignup: config.PUBLIC_SIGNUP || (await prisma.user.count()) === 0,
+      allowPublicSignup: config.PUBLIC_SIGNUP,
     });
     const refresh = await issueRefreshToken(user.id, clientMeta(req));
     setSessionCookies(res, refresh);

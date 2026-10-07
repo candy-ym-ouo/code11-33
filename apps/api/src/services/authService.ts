@@ -1,5 +1,5 @@
 import { argon2Verify, argon2id } from 'hash-wasm';
-import type { Prisma, User } from '@prisma/client';
+import { Prisma, type User } from '@prisma/client';
 import { prisma } from '../db';
 import { conflict, unauthenticated, badRequest } from '../http/errors';
 import { randomBytes } from 'node:crypto';
@@ -45,6 +45,9 @@ export async function verifyPassword(password: string, hash: string): Promise<bo
   }
 }
 
+/** 注册串行化用的 advisory lock key：任意固定的 64 位整数，专属于「首个用户判定」这一用途。 */
+const REGISTRATION_LOCK_KEY = 913_770_001;
+
 export async function register(
   input: { email: string; password: string; displayName: string },
   meta: { ip?: string | null; userAgent?: string | null; allowPublicSignup: boolean },
@@ -52,26 +55,39 @@ export async function register(
   const existing = await prisma.user.findUnique({ where: { email: input.email } });
   if (existing) throw conflict('该邮箱已注册');
 
-  const userCount = await prisma.user.count();
-  const isFirstUser = userCount === 0;
-  if (!isFirstUser && !meta.allowPublicSignup) {
-    throw conflict('本系统未开放公开注册，请使用家人发来的邀请链接加入');
-  }
-
+  // 密码哈希耗时较长，放在事务外计算，避免长时间占着注册锁
   const passwordHash = await hashPassword(input.password);
   const colors = ['#2F4858', '#A44A3F', '#3F6B4A', '#6B4E71', '#8A6D3B'];
-  const avatarColor = colors[userCount % colors.length]!;
 
   const user = await prisma.$transaction(async (tx) => {
-    const created = await tx.user.create({
-      data: {
-        email: input.email,
-        passwordHash,
-        displayName: input.displayName,
-        avatarColor,
-        systemRole: isFirstUser ? 'sysadmin' : 'user',
-      },
-    });
+    // 首个用户判定必须原子化：先取事务级 advisory 锁（提交/回滚时自动释放），
+    // 并发注册在此串行，只有一笔事务能数到 0 个用户并获得系统管理员身份。
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(${REGISTRATION_LOCK_KEY})`;
+
+    const userCount = await tx.user.count();
+    const isFirstUser = userCount === 0;
+    if (!isFirstUser && !meta.allowPublicSignup) {
+      throw conflict('本系统未开放公开注册，请使用家人发来的邀请链接加入');
+    }
+
+    let created: User;
+    try {
+      created = await tx.user.create({
+        data: {
+          email: input.email,
+          passwordHash,
+          displayName: input.displayName,
+          avatarColor: colors[userCount % colors.length]!,
+          systemRole: isFirstUser ? 'sysadmin' : 'user',
+        },
+      });
+    } catch (err) {
+      // 事务外的邮箱预检挡不住并发同邮箱注册，由唯一约束兜底并映射回业务错误
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+        throw conflict('该邮箱已注册');
+      }
+      throw err;
+    }
     await audit.record(
       {
         actorId: created.id,
