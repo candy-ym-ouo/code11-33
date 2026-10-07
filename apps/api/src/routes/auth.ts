@@ -33,7 +33,7 @@ authRouter.post(
   asyncHandler(async (req, res) => {
     const user = await authService.register(req.body, {
       ...clientMeta(req),
-      allowPublicSignup: config.PUBLIC_SIGNUP || (await prisma.user.count()) === 0,
+      allowPublicSignup: config.PUBLIC_SIGNUP,
     });
     const refresh = await issueRefreshToken(user.id, clientMeta(req));
     setSessionCookies(res, refresh);

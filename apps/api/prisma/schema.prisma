@@ -114,6 +114,9 @@ model User {
   displayName  String        @map("display_name")
   avatarColor  String        @default("#2F4858") @map("avatar_color")
   systemRole   SystemRole    @default(user) @map("system_role")
+  // sysadmin 单例列：sysadmin 用户该列为 1，其余为 NULL。
+  // 配合唯一索引（PG 允许多个 NULL）从数据库层保证系统至多一个系统管理员。
+  sysadminSlot Int?          @unique @map("sysadmin_slot")
   status       AccountStatus @default(active)
   createdAt    DateTime      @default(now()) @map("created_at")
   updatedAt    DateTime      @updatedAt @map("updated_at")

@@ -1,5 +1,5 @@
 import { argon2Verify, argon2id } from 'hash-wasm';
-import type { Prisma, User } from '@prisma/client';
+import { Prisma, type User } from '@prisma/client';
 import { prisma } from '../db';
 import { conflict, unauthenticated, badRequest } from '../http/errors';
 import { randomBytes } from 'node:crypto';
@@ -45,33 +45,60 @@ export async function verifyPassword(password: string, hash: string): Promise<bo
   }
 }
 
+// 「首个用户」判定的咨询锁命名空间：固定 (namespace, key)，只用于注册串行化。
+// 所有注册请求都先抢同一把事务级咨询锁，保证 count() 判定与建号写入串行化，
+// 竞争请求里只有一个能在 users 表为空时完成写入、拿到 sysadmin 身份。
+const REGISTER_LOCK_NAMESPACE = 0x5245_474d; // 'REGM'
+const FIRST_USER_LOCK_KEY = 1;
+
 export async function register(
   input: { email: string; password: string; displayName: string },
   meta: { ip?: string | null; userAgent?: string | null; allowPublicSignup: boolean },
 ): Promise<User> {
+  // 快速失败路径：邮箱占用与密码哈希放在锁外，避免无谓地串行化注册请求。
   const existing = await prisma.user.findUnique({ where: { email: input.email } });
   if (existing) throw conflict('该邮箱已注册');
 
-  const userCount = await prisma.user.count();
-  const isFirstUser = userCount === 0;
-  if (!isFirstUser && !meta.allowPublicSignup) {
-    throw conflict('本系统未开放公开注册，请使用家人发来的邀请链接加入');
-  }
-
   const passwordHash = await hashPassword(input.password);
-  const colors = ['#2F4858', '#A44A3F', '#3F6B4A', '#6B4E71', '#8A6D3B'];
-  const avatarColor = colors[userCount % colors.length]!;
 
   const user = await prisma.$transaction(async (tx) => {
-    const created = await tx.user.create({
-      data: {
-        email: input.email,
-        passwordHash,
-        displayName: input.displayName,
-        avatarColor,
-        systemRole: isFirstUser ? 'sysadmin' : 'user',
-      },
-    });
+    // 事务级咨询锁，COMMIT/ROLLBACK 时自动释放。
+    // 并发注册在此排队：只有拿到锁后看到「表为空」的请求能成为首个用户。
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(${REGISTER_LOCK_NAMESPACE}, ${FIRST_USER_LOCK_KEY})`;
+
+    // 锁内再次确认邮箱，挡住「锁外检查后另一个请求已注册同邮箱」的窗口。
+    const emailTaken = await tx.user.findUnique({ where: { email: input.email } });
+    if (emailTaken) throw conflict('该邮箱已注册');
+
+    const userCount = await tx.user.count();
+    const isFirstUser = userCount === 0;
+    if (!isFirstUser && !meta.allowPublicSignup) {
+      throw conflict('本系统未开放公开注册，请使用家人发来的邀请链接加入');
+    }
+
+    const colors = ['#2F4858', '#A44A3F', '#3F6B4A', '#6B4E71', '#8A6D3B'];
+    const avatarColor = colors[userCount % colors.length]!;
+
+    let created: User;
+    try {
+      created = await tx.user.create({
+        data: {
+          email: input.email,
+          passwordHash,
+          displayName: input.displayName,
+          avatarColor,
+          systemRole: isFirstUser ? 'sysadmin' : 'user',
+          // sysadmin 单例列：只有首个用户占用唯一槽位，其余为 NULL
+          sysadminSlot: isFirstUser ? 1 : null,
+        },
+      });
+    } catch (err) {
+      // 兜底：唯一槽位已被占用（理论上被上面的咨询锁挡住，仅在异常竞态下触发）
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+        throw conflict('系统管理员已存在，请使用家人发来的邀请链接加入');
+      }
+      throw err;
+    }
     await audit.record(
       {
         actorId: created.id,
